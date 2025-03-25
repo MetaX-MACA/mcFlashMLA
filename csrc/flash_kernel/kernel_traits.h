@@ -99,8 +99,15 @@ struct Flash_fwd_kernel_traits : public Base {
                     // This has to be kBlockKSmem, using kHeadDim gives wrong results for d=128
                     Layout<Shape<_16, Int<kBlockKSmem>>,
                            Stride<Int<kBlockKSmem>, _1>>{}));
+    using SmemLayoutAtomQ424 = decltype(
+        composition(Swizzle<4, 2, 4>{},
+                    Layout<Shape<_16, Int<kBlockKSmem>>,
+                           Stride<Int<kBlockKSmem>, _1>>{}));
     using SmemLayoutQ = decltype(tile_to_shape(
         SmemLayoutAtomQ{},
+        Shape<Int<kBlockM>, Int<kHeadDim>>{}));
+    using SmemLayoutQ424 = decltype(tile_to_shape(
+        SmemLayoutAtomQ424{},
         Shape<Int<kBlockM>, Int<kHeadDim>>{}));
 
     using SmemLayoutNopeQ = decltype(tile_to_shape(

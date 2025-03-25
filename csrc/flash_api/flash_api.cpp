@@ -22,13 +22,10 @@
 // splits as that would incur more HBM reads/writes.
 // So we find the best efficiency, then find the smallest number of splits that gets 85%
 // of the best efficiency.
-int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits) {
+int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits, float balance_weight) {
     // If we have enough to almost fill the SMs, then just use 1 split
-    if (batch_nheads_mblocks >= 0.8f * num_SMs) { return 1; }
+    // if (batch_nheads_mblocks >= 0.9f * num_SMs) { return 1; }
     max_splits = std::min({max_splits, num_SMs, num_n_blocks});
-    // if (max_splits < 64 || batch_nheads_mblocks / 64 > 10) {
-    //     return 1;
-    // }
     float max_efficiency = 0.f;
     std::vector<float> efficiency;
     efficiency.reserve(max_splits);
@@ -53,7 +50,7 @@ int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks
     }
     for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
         if (!is_split_eligible(num_splits)) { continue; }
-        if (efficiency[num_splits - 1] >= 0.85 * max_efficiency) {
+        if (efficiency[num_splits - 1] >= balance_weight * max_efficiency) {
             // printf("num_splits chosen = %d\n", num_splits);
             return num_splits;
         }
@@ -70,15 +67,17 @@ void compute_params_numsplits(mcFlashAttn::Flash_fwd_mla_params &params, const i
 
     const int block_n = 16;
     const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
-    const int block_m = 32;
+    const int block_m = max_seqlen_q >= 64 ? 64 : 32;
     const int num_m_blocks = (max_seqlen_q + block_m - 1) / block_m;
     params.num_splits = num_splits;
 
     if (num_splits < 1) {
         const int AP_nums = dprops->multiProcessorCount;
         int block_nums_per_AP = 1;
+        // TODO: fine tune balance_weight later
+        float balance_weight = batch_size == 128 ? 0.95 : 0.9;
         params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks,  AP_nums * block_nums_per_AP,
-                                                    num_n_blocks, 128);
+                                                    num_n_blocks, 128, balance_weight);
     }
 }
 
@@ -203,6 +202,7 @@ mha_fwd_kvcache_mla(
     // Set the sizes.
     params.b = batch_size;
     params.seqlen_q = seqlen_q;
+    params.seqlen_k = seqlens_k.max().cpu().item<int>();
     params.cu_seqlens_k = seqlens_k.data_ptr<int>();
     params.is_seqlens_k_cumulative = false; // seqlens_k always has value
     params.h = num_heads;
@@ -249,8 +249,8 @@ mha_fwd_kvcache_mla(
     // params.num_splits_ptr = num_splits.data_ptr<int>();
 
     const int max_num_splits = 128;
-    params.num_splits = 2; // TODO: adjust num_splits by compute_params_numsplits later
-    // compute_params_numsplits(params, 0);
+    // TODO: enable get_mla_mate_data for load balance
+    compute_params_numsplits(params, 0);
     TORCH_CHECK(params.num_splits <= max_num_splits, "num_splits must less than or equal to 128");
     at::Tensor softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q}, opts.dtype(torch::kFloat32));
     at::Tensor out_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q, head_size_v}, opts.dtype(torch::kFloat32));

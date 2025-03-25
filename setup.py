@@ -137,7 +137,7 @@ ext_modules = []
 
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
-subprocess.run(["git", "submodule", "update", "--init", "csrc/mctlass"])
+# subprocess.run(["git", "submodule", "update", "--init", "csrc/mctlass"])
 
 if not SKIP_CUDA_BUILD:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
@@ -184,6 +184,10 @@ if not SKIP_CUDA_BUILD:
             sources=[
                 "csrc/flash_api/flash_api.cpp",
                 "csrc/flash_run/run_mha_fwd.cpp",
+                "csrc/flash_api/flash_fwd_splitkv_hdimqk576_hdimv512_m16n16_bf16_True_True_sm80.cu",
+                "csrc/flash_api/flash_fwd_splitkv_hdimqk576_hdimv512_m16n16_bf16_True_True_split_sm80.cu",
+                "csrc/flash_api/flash_fwd_splitkv_hdimqk576_hdimv512_m16n16_fp16_True_True_sm80.cu",
+                "csrc/flash_api/flash_fwd_splitkv_hdimqk576_hdimv512_m16n16_fp16_True_True_split_sm80.cu",
                 "csrc/flash_api/flash_fwd_splitkv_hdimqk576_hdimv512_m32n16_bf16_True_True_sm80.cu",
                 "csrc/flash_api/flash_fwd_splitkv_hdimqk576_hdimv512_m32n16_bf16_True_True_split_sm80.cu",
                 "csrc/flash_api/flash_fwd_splitkv_hdimqk576_hdimv512_m32n16_fp16_True_True_sm80.cu",

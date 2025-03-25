@@ -15,6 +15,7 @@
 #include "mask.h"
 #include "rotary.h"
 #include "attn_mask.h"
+#include "flash_fwd_split_kernel_k64_16x16_4waves.h"
 #include "flash_fwd_split_kernel_k64_32x16_4waves.h"
 #include "flash_fwd_split_kernel_k64_64x16_8waves.h"
 
@@ -36,6 +37,9 @@ __forceinline__ __device__ void compute_attn_splitkv(const Params &params, const
                 params, bidb, bidh, m_block, n_split_idx, num_n_splits);
     } else if constexpr (Kernel_traits::kBlockM == 64 && Kernel_traits::kBlockN == 16 && Kernel_traits::kNWarps == 8) {
         compute_attn_1rowblock_splitkv_k64_mla_64x16_8waves<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split>(
+                params, bidb, bidh, m_block, n_split_idx, num_n_splits);
+    } else if constexpr (Kernel_traits::kBlockM == 16 && Kernel_traits::kBlockN == 16 && Kernel_traits::kNWarps == 4) {
+        compute_attn_1rowblock_splitkv_k64_mla_16x16_4waves<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split>(
                 params, bidb, bidh, m_block, n_split_idx, num_n_splits);
     }
 }

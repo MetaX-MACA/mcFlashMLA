@@ -43,8 +43,13 @@ namespace mcFlashAttn {
                     constexpr static int kBlockN = 16;
                     constexpr static int kNWarps = 8;
                     run_flash_splitkv_fwd_template<HeaddimQK, kBlockM, kBlockN, kNWarps, true, true, elem_type, Is_splits, HeaddimVO, Num_Stages>(params, stream);
-                } else {
+                } else if (params.seqlen_q >= 32) {
                     constexpr static int kBlockM = 32;
+                    constexpr static int kBlockN = 16;
+                    constexpr static int kNWarps = 4;
+                    run_flash_splitkv_fwd_template<HeaddimQK, kBlockM, kBlockN, kNWarps, true, true, elem_type, Is_splits, HeaddimVO, Num_Stages>(params, stream);
+                } else {
+                    constexpr static int kBlockM = 16;
                     constexpr static int kBlockN = 16;
                     constexpr static int kNWarps = 4;
                     run_flash_splitkv_fwd_template<HeaddimQK, kBlockM, kBlockN, kNWarps, true, true, elem_type, Is_splits, HeaddimVO, Num_Stages>(params, stream);
