@@ -2,7 +2,7 @@ MetaX-MACA/FlashMLA是deepseek-ai/FlashMLA算法在MXMACA软件栈及FlashAttent
 MetaX-MACA/FlashMLA is the implementation of the deepseek-ai/FlashMLA algorithm on the MXMACA software stack and FlashAttention-2 (version 2.6.3). MetaX-MACA/FlashMLA (“This software”) is licensed under MIT. This software also contains third-party open source components, the open source licenses of which are listed below.
 
 Copyright © 2025-2026 MetaX Integrated Circuits (Shanghai) Co., Ltd.
-版权所有©2026 沐曦集成电路（上海）股份有限公司。
+版权所有©2025-2026 沐曦集成电路（上海）股份有限公司。
 
 MIT License
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
@@ -18,7 +18,7 @@ This software also contains code from deepseek-ai /FlashMLA（https://github.com
 
 deepseek-ai /FlashMLA
 MIT License
-Copyright (c) 2025-2026 DeepSeek
+Copyright (c) 2025 DeepSeek
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
