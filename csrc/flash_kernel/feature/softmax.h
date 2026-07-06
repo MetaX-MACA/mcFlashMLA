@@ -12,7 +12,6 @@
 
 #include <mctlass/numeric_types.h>
 
-#include "philox.cuh"
 #include "utils.h"
 
 namespace flash {
@@ -41,7 +40,7 @@ __device__ __forceinline__ void quad_allreduce_(Tensor<Engine0, Layout0> &dst, T
     CUTE_STATIC_ASSERT_V(size(dst) == size(src));
     #pragma unroll
     for (int i = 0; i < size(dst); i++){
-        dst(i) = Allreduce<64>::run(src(i), op);
+        dst(i) = Partialreduce::run(src(i), op);
     }
 }
 
@@ -220,6 +219,50 @@ struct Softmax {
             #pragma unroll
             for (int mi = 0; mi < size<0>(scores); mi++) {
                 if constexpr(AddVec) {
+                    Float2 x_vec = {row_sum(mi), 0.0f};
+                    Float2 scale_vec = {1.0f, 1.0f};
+                    #pragma unroll
+                    for (int ni = 0; ni < size<1>(scores); ni += 2) {
+                        Float2 beta_vec = {scores(mi, ni), scores(mi, ni + 1)};
+                        x_vec = __builtin_mxc_pk_fma_f32(x_vec, scale_vec, beta_vec);
+                    }
+                    row_sum(mi) = x_vec[0] + x_vec[1];
+                }
+                else {
+                    #pragma unroll
+                    for (int ni = 0; ni < size<1>(scores); ni++) {
+                        row_sum(mi) += scores(mi, ni);
+                    }
+                }
+            }
+        }
+    };
+
+    template<bool Is_first, bool Check_inf=false, bool Syncthreads=false, bool AddVec=false, typename Tensor0, typename Tensor1, typename Tensor2>
+    __forceinline__ __device__ void softmax_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, Tensor2 &sRowMax, float softmax_scale_log2) {
+        // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
+        Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        MaxOp<float> max_op;
+        static_assert(decltype(size<0>(scores))::value == kNRows);
+        static_assert(decltype(size<1>(scores))::value % 2 == 0);
+        typedef __NATIVE_VECTOR__(2, float) Float2;
+        const int tidx = threadIdx.x;
+        const int wave_idx = tidx / 64;
+        const int lane_idx = tidx % 64;
+        const int wave_group_idx = wave_idx / 4;
+        const int row_offset = wave_idx % 4 * 16 + lane_idx % 16;
+        if constexpr (Is_first) {
+            flash::template thread_reduce_</*zero_init=*/true>(scores, row_max, max_op);
+            flash::template quad_allreduce_(row_max, row_max, max_op);
+            if (lane_idx / 16 == 0) {
+                sRowMax(wave_group_idx, row_offset) = row_max(0); //sts row_max
+            }
+            flash::sync_threads();
+            row_max(0) = max(row_max(0), sRowMax(wave_group_idx ^ 1, row_offset)); //lds row_max
+            flash::scale_apply_exp2(scores, row_max, softmax_scale_log2);
+            if constexpr(AddVec) {
+                #pragma unroll
+                for (int mi = 0; mi < size<0>(scores); mi++) {
                     Float2 x_vec = { 0.0f, 0.0f};
                     Float2 scale_vec = {1.0f, 1.0f};
                     #pragma unroll
@@ -227,7 +270,159 @@ struct Softmax {
                         Float2 beta_vec = {scores(mi, ni), scores(mi, ni + 1)};
                         x_vec = __builtin_mxc_pk_fma_f32(x_vec, scale_vec, beta_vec);
                     }
-                    row_sum(mi) += x_vec[0] + x_vec[1];
+                    row_sum(mi) = x_vec[0] + x_vec[1];
+                }
+            } else {
+                SumOp<float> sum_op;
+                flash::thread_reduce_</*zero_init=*/true>(scores, row_sum, sum_op);
+            }
+        } else {
+            Tensor scores_max_prev = make_fragment_like(row_max);
+            cute::copy(row_max, scores_max_prev);
+            flash::template thread_reduce_</*zero_init=*/false>(scores, row_max, max_op);
+            flash::template quad_allreduce_(row_max, row_max, max_op);
+            if (lane_idx / 16 == 0) {
+                sRowMax(wave_group_idx, row_offset) = row_max(0); //sts row_max
+            }
+            flash::sync_threads();
+            row_max(0) = max(row_max(0), sRowMax(wave_group_idx ^ 1, row_offset)); //lds row_max
+            // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
+            Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
+            static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
+            static_assert(decltype(size<1>(acc_o_rowcol))::value % 2 == 0);
+            #pragma unroll
+            for (int mi = 0; mi < size(row_max); ++mi) {
+                float scores_max_cur = !Check_inf
+                    ? row_max(mi)
+                    : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
+                float scores_scale = __builtin_exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+                row_sum(mi) *= scores_scale;
+                Float2 scale_vec = {scores_scale , scores_scale};
+                Float2 beta_vec = {0.0f, 0.0f};
+                #pragma unroll
+                for (int ni = 0; ni < size<1>(acc_o_rowcol); ni += 2) {
+                    Float2 x_vec = {acc_o_rowcol(mi, ni),  acc_o_rowcol(mi, ni + 1)};
+                    x_vec = __builtin_mxc_pk_fma_f32(x_vec, scale_vec, beta_vec);
+                    acc_o_rowcol(mi, ni) = x_vec[0];
+                    acc_o_rowcol(mi, ni + 1) = x_vec[1];
+                }
+            }
+            flash::scale_apply_exp2(scores, row_max, softmax_scale_log2);
+            #pragma unroll
+            for (int mi = 0; mi < size<0>(scores); mi++) {
+                if constexpr(AddVec) {
+                    Float2 x_vec = {row_sum(mi), 0.0f};
+                    Float2 scale_vec = {1.0f, 1.0f};
+                    #pragma unroll
+                    for (int ni = 0; ni < size<1>(scores); ni += 2) {
+                        Float2 beta_vec = {scores(mi, ni), scores(mi, ni + 1)};
+                        x_vec = __builtin_mxc_pk_fma_f32(x_vec, scale_vec, beta_vec);
+                    }
+                    row_sum(mi) = x_vec[0] + x_vec[1];
+                }
+                else {
+                    #pragma unroll
+                    for (int ni = 0; ni < size<1>(scores); ni++) {
+                        row_sum(mi) += scores(mi, ni);
+                    }
+                }
+            }
+        }
+    }
+
+    template<bool Is_first, typename Tensor0, typename Tensor1, typename Tensor2>
+    __forceinline__ __device__ void get_row_max(Tensor0 &acc_s, Tensor1 &scores_max_prev, Tensor2 &sRowMax,float softmax_scale_log2) {
+        Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        MaxOp<float> max_op;
+        static_assert(decltype(size<0>(scores))::value == kNRows);
+        static_assert(decltype(size<1>(scores))::value % 2 == 0);
+        const int tidx = threadIdx.x;
+        const int wave_idx = tidx / 64;
+        const int lane_idx = tidx % 64;
+        const int wave_group_idx = wave_idx / 4;
+        const int row_offset = wave_idx % 4 * 16 + lane_idx % 16;
+        if constexpr (Is_first) {
+            flash::template thread_reduce_</*zero_init=*/true>(scores, row_max, max_op);
+            flash::template quad_allreduce_(row_max, row_max, max_op);
+            if (lane_idx / 16 == 0) {
+                sRowMax(wave_group_idx, row_offset) = row_max(0); //sts row_max
+            }
+            flash::sync_threads();
+            row_max(0) = max(row_max(0), sRowMax(wave_group_idx ^ 1, row_offset)); //lds row_max
+        } else {
+            cute::copy(row_max, scores_max_prev);
+            flash::template thread_reduce_</*zero_init=*/false>(scores, row_max, max_op);
+            flash::template quad_allreduce_(row_max, row_max, max_op);
+            if (lane_idx / 16 == 0) {
+                sRowMax(wave_group_idx, row_offset) = row_max(0); //sts row_max
+            }
+            flash::sync_threads();
+            row_max(0) = max(row_max(0), sRowMax(wave_group_idx ^ 1, row_offset)); //lds row_max
+        }
+    }
+
+    template<bool Is_first, bool Check_inf=false, bool AddVec=false, typename Tensor0, typename Tensor1, typename Tensor2>
+    __forceinline__ __device__ void softmax_rescale_o_without_row_max(Tensor0 &acc_s, Tensor1 &acc_o, Tensor2 &scores_max_prev, float softmax_scale_log2) {
+        // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
+        Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        static_assert(decltype(size<0>(scores))::value == kNRows);
+        static_assert(decltype(size<1>(scores))::value % 2 == 0);
+        typedef __NATIVE_VECTOR__(2, float) Float2;
+        if constexpr (Is_first) {
+            flash::scale_apply_exp2(scores, row_max, softmax_scale_log2);
+            if constexpr (AddVec) {
+                #pragma unroll
+                for (int mi = 0; mi < size<0>(scores); mi++) {
+                    Float2 x_vec = {0.0f, 0.0f};
+                    Float2 scale_vec = {1.0f, 1.0f};
+                    #pragma unroll
+                    for (int ni = 0; ni < size<1>(scores); ni += 2) {
+                        Float2 beta_vec = {scores(mi, ni), scores(mi, ni + 1)};
+                        x_vec = __builtin_mxc_pk_fma_f32(x_vec, scale_vec, beta_vec);
+                    }
+                    row_sum(mi) = x_vec[0] + x_vec[1];
+                }
+            }
+            else {
+                SumOp<float> sum_op;
+                flash::thread_reduce_</*zero_init=*/true>(scores, row_sum, sum_op);
+            }
+        } else {
+            // Reshape acc_o from (MMA=4, MMA_M, MMA_K) to (nrow=(2, MMA_M), ncol=(2, MMA_K))
+            Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
+            static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
+            static_assert(decltype(size<1>(acc_o_rowcol))::value % 2 == 0);
+            #pragma unroll
+            for (int mi = 0; mi < size(row_max); ++mi) {
+                float scores_max_cur = !Check_inf
+                    ? row_max(mi)
+                    : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
+                float scores_scale = __builtin_exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+                row_sum(mi) *= scores_scale;
+                // #pragma unroll
+                // for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale; }
+                Float2 scale_vec = {scores_scale , scores_scale};
+                Float2 beta_vec = {0.0f, 0.0f};
+                #pragma unroll
+                for (int ni = 0; ni < size<1>(acc_o_rowcol); ni += 2) {
+                    Float2 x_vec = {acc_o_rowcol(mi, ni),  acc_o_rowcol(mi, ni + 1)};
+                    x_vec = __builtin_mxc_pk_fma_f32(x_vec, scale_vec, beta_vec);
+                    acc_o_rowcol(mi, ni) = x_vec[0];
+                    acc_o_rowcol(mi, ni + 1) = x_vec[1];
+                }
+            }
+            flash::scale_apply_exp2(scores, row_max, softmax_scale_log2);
+            #pragma unroll
+            for (int mi = 0; mi < size<0>(scores); mi++) {
+                if constexpr(AddVec) {
+                    Float2 x_vec = {row_sum(mi), 0.0f};
+                    Float2 scale_vec = {1.0f, 1.0f};
+                    #pragma unroll
+                    for (int ni = 0; ni < size<1>(scores); ni += 2) {
+                        Float2 beta_vec = {scores(mi, ni), scores(mi, ni + 1)};
+                        x_vec = __builtin_mxc_pk_fma_f32(x_vec, scale_vec, beta_vec);
+                    }
+                    row_sum(mi) = x_vec[0] + x_vec[1];
                 }
                 else {
                     #pragma unroll
@@ -240,8 +435,50 @@ struct Softmax {
     };
 
     template<bool Is_dropout=false, bool Return_lse=true, bool Split=false, typename Tensor0>
-    __forceinline__ __device__ TensorT normalize_softmax_lse(Tensor0 &acc_o, float softmax_scale, float rp_dropout=1.0) {
+    __forceinline__ __device__ TensorT normalize_softmax_lse(Tensor0 &acc_o, float softmax_scale, float rp_dropout=1.0, float k_descale=1.0) {
         flash::quadreduce_sum(row_sum);
+        TensorT lse = make_fragment_like(row_sum);
+        Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
+        static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
+        static_assert(decltype(size<1>(acc_o_rowcol))::value % 2 == 0);
+        typedef __NATIVE_VECTOR__(2, float) Float2;
+        #pragma unroll
+        for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
+            float sum = row_sum(mi);
+            float inv_sum = (sum == 0.f || sum != sum) ? 1.f : k_descale / sum;
+            if (Return_lse)
+                lse(mi) = (sum == 0.f || sum != sum) ? (Split ? -INFINITY : INFINITY) : row_max(mi) * softmax_scale + __logf(sum);
+            float scale = !Is_dropout ? inv_sum : inv_sum * rp_dropout;
+            // #pragma unroll
+            // for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
+            //     acc_o_rowcol(mi,  ni) *= scale;
+            // }
+            Float2 scale_vec = {scale, scale};
+            Float2 beta_vec = {0.0f, 0.0f};
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(acc_o_rowcol); ni += 2) {
+                Float2 x_vec = {acc_o_rowcol(mi, ni), acc_o_rowcol(mi, ni + 1)};
+                x_vec = __builtin_mxc_pk_fma_f32(x_vec, scale_vec, beta_vec);
+                acc_o_rowcol(mi, ni) = x_vec[0];
+                acc_o_rowcol(mi, ni + 1) = x_vec[1];
+            }
+        }
+        return lse;
+    };
+
+    template<bool Is_dropout=false, bool Return_lse=true, bool Split=false, typename Tensor0, typename Tensor1>
+    __forceinline__ __device__ TensorT normalize_softmax_lse(Tensor0 &acc_o, Tensor1 &sRowSum, float softmax_scale, float rp_dropout=1.0) {
+        const int tidx = threadIdx.x;
+        const int wave_idx = tidx / 64;
+        const int lane_idx = tidx % 64;
+        const int wave_group_idx = wave_idx / 4;
+        const int row_offset = wave_idx % 4 * 16 + lane_idx % 16;
+        flash::quadreduce_sum(row_sum);
+        if (lane_idx / 16 == 0) {
+            sRowSum(wave_group_idx, row_offset) = row_sum(0); //sts row_max
+        }
+        flash::sync_threads();
+        row_sum(0) += sRowSum(wave_group_idx ^ 1, row_offset); //lds row_max
         TensorT lse = make_fragment_like(row_sum);
         Tensor acc_o_rowcol = make_tensor(acc_o.data(), flash::convert_layout_acc_rowcol(acc_o.layout()));
         static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
@@ -255,10 +492,6 @@ struct Softmax {
             if (Return_lse)
                 lse(mi) = (sum == 0.f || sum != sum) ? (Split ? -INFINITY : INFINITY) : row_max(mi) * softmax_scale + __logf(sum);
             float scale = !Is_dropout ? inv_sum : inv_sum * rp_dropout;
-            // #pragma unroll
-            // for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
-            //     acc_o_rowcol(mi,  ni) *= scale;
-            // }
             Float2 scale_vec = {scale, scale};
             Float2 beta_vec = {0.0f, 0.0f};
             #pragma unroll
