@@ -7,7 +7,8 @@
 
 #include <cuda.h>
 #include <vector>
-
+#include "mctlass/bfloat16.h"
+#include "static_switch.h"
 constexpr int maxValidBlockSizeM = 128;
 
 namespace mcFlashAttn {
@@ -30,6 +31,10 @@ struct Qkv_params {
     index_t q_head_stride;
     index_t k_head_stride;
     index_t v_head_stride;
+    index_t indices_batch_stride;
+    index_t indices_row_stride;
+    index_t indices_all_valid_per_q_batch_stride;
+    index_t indices_all_valid_per_q_row_stride;
 
     // The number of heads.
     int h, h_k;
@@ -62,6 +67,8 @@ struct Flash_fwd_mla_params : public Qkv_params {
     // The dimensions.
     int b, seqlen_q, seqlen_k, seqlen_knew, d, d_v, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim, total_q;
     int ngroups;
+    bool is_sparse_attn = false;
+    int topk;
 
     // The scaling factors for the kernel.
     float scale_softmax;
@@ -71,31 +78,14 @@ struct Flash_fwd_mla_params : public Qkv_params {
     int * __restrict__ cu_seqlens_q;
     int * __restrict__ cu_seqlens_k;
     int * __restrict__ leftpad_k;
+    int *__restrict__ indices_ptr;   // [batch, s_q, topk]
 
     // If provided, the actual length of each k sequence.
     int * __restrict__ seqused_k;
 
-    int *__restrict__ blockmask;
-
     // The K_new and V_new matrices.
     void * __restrict__ knew_ptr;
     void * __restrict__ vnew_ptr;
-
-    // The stride between rows of the Q, K and V matrices.
-    index_t knew_batch_stride;
-    index_t vnew_batch_stride;
-    index_t knew_row_stride;
-    index_t vnew_row_stride;
-    index_t knew_head_stride;
-    index_t vnew_head_stride;
-
-    // kv cache dequant
-    index_t kscale_batch_stride;
-    index_t vscale_batch_stride;
-    index_t kscale_row_stride;
-    index_t vscale_row_stride;
-    index_t kscale_head_stride;
-    index_t vscale_head_stride;
 
     // The cos and sin matrices for rotary embedding.
     void * __restrict__ rotary_cos_ptr;
@@ -115,65 +105,45 @@ struct Flash_fwd_mla_params : public Qkv_params {
     void *__restrict__ k_scale_ptr;
     void *__restrict__ v_scale_ptr;
 
-    // The dropout probability (probability of keeping an activation).
-    float p_dropout;
-    // uint32_t p_dropout_in_uint;
-    // uint16_t p_dropout_in_uint16_t;
-    uint8_t p_dropout_in_uint8_t;
-
     // Scale factor of 1 / (1 - p_dropout).
     float rp_dropout;
-    float scale_softmax_rp_dropout;
-
-    // Local window size
-    int window_size_left, window_size_right;
-
-    // ratio of softcapping attention
-    // S = exp2(log2(e) * softcap * tanh(S * softmax_scale / softcap))
-    // only value > 0.0 will take effect
-    float softcap;
-
-    // Random state.
-    // at::PhiloxCudaState philox_args;
 
     // the RNG seed and offset .
     uint64_t rng_state_seed = 0;
     uint64_t rng_state_offset = 0;
 
     bool is_bf16;
+    bool is_fp8 = false;
     bool is_causal;
+    bool* indices_all_valid_per_q_ptr;
 
     // If is_seqlens_k_cumulative, then seqlen_k is cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb].
     // Otherwise it's cu_seqlens_k[bidb], i.e., we use cu_seqlens_k to store the sequence lengths of K.
     bool is_seqlens_k_cumulative;
 
-    bool is_rotary_interleaved;
-
     int num_splits;  // For split-KV version
-
-    void * __restrict__ alibi_slopes_ptr;
-    index_t alibi_slopes_batch_stride;
-
-    // attn_mask support for bert model Jira[C500-21935]
-    bool has_attn_mask;
-    void * __restrict__ attn_mask_ptr = nullptr;
-    index_t attn_mask_batch_stride = 0;
-    index_t attn_mask_nheads_stride = 0;
-    index_t attn_mask_row_stride = 0;
-    index_t attn_mask_col_stride = 1;
-
-    index_t attn_mask_batch_shape = 1;
-    index_t attn_mask_nheads_shape = 1;
-    index_t attn_mask_row_shape = 1;
-    index_t attn_mask_col_shape = 1;
 
     bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
 
     int d_value;
     int d_value_rounded;
+    int arch;
 
-    bool is_support_splitkv = false;
+    int *__restrict__ tile_scheduler_metadata_ptr;
+    int num_sm_parts;
+    int *__restrict__ num_splits_ptr;
+
+    // fp8 params
+    float* __restrict__ descale_q_ptr = nullptr;
+    float* __restrict__ descale_k_ptr = nullptr;
+
+    // CP (Context Parallelism) parameters
+    int cp_world_size;
+    int cp_rank;
+    int *__restrict__ cp_tot_seqused_k;
+
+    cudaStream_t stream;
 };
 
 
@@ -187,12 +157,46 @@ struct Flash_launch_params {
     Flash_launch_params():
         is_balance(false),rowblock_parallel(0),block_type(0),performance_mode(false){}
 };
-
 }
+
+struct SparsePrefillParams {
+    int s_q, s_kv, h_q, h_kv, d_qk, d_v, topk;
+    float sm_scale, sm_scale_div_log2;
+    int arch;
+
+    // Input tensors
+    mctlass::bfloat16_t* __restrict__ q_ptr;    // [s_q, h_q, d_qk]
+    mctlass::bfloat16_t* __restrict__ kv_ptr;   // [s_kv, h_kv, d_qk]
+    int* __restrict__ indices_ptr;   // [s_q, h_kv, topk]
+    bool* indices_all_valid_per_q_ptr; // [1]
+
+    // int stride_q_s_q; int stride_q_h_q;
+    // int stride_kv_s_kv; int stride_kv_h_kv;
+    int q_row_stride;int q_head_stride;
+    int k_row_stride;int k_head_stride;
+    int stride_indices_s_q; int stride_indices_h_kv;
+    int o_row_stride;int o_head_stride;
+    // Output tensors
+    mctlass::bfloat16_t* __restrict__ out_ptr;   // [s_q, h_q, d_v]
+    float* __restrict__ max_logits; // [s_q, h_q]
+    float* __restrict__ lse_ptr; // [s_q, h_q]
+
+    cudaStream_t stream;
+};
 
 static constexpr int TileSchedulerMetaDataSize = 8;
 // [begin_idx, begin_seqlen, end_idx, end_seqlen, begin_n_split_idx, _, _, _]
 
+struct GetDecodingMetadataParams {
+    int *__restrict__ seqlens_k_ptr;
+    int *__restrict__ tile_scheduler_metadata_ptr;
+    int *__restrict__ num_splits_ptr;
+    int batch_size;
+    int block_size_n;
+    int fixed_overhead_num_blocks;
+    int num_sm_parts;
+    int topk;
+};
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct Mla_metadata_params {
@@ -205,4 +209,4 @@ struct Mla_metadata_params {
     int num_sm_parts;
 };
 
-void get_mla_metadata_func(Mla_metadata_params &params, cudaStream_t stream);
+void run_get_mla_metadata_kernel(GetDecodingMetadataParams &params, cudaStream_t stream);
