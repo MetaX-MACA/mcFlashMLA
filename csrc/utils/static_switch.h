@@ -2,8 +2,10 @@
 // Inspired by
 // https://github.com/NVIDIA/DALI/blob/main/include/dali/core/static_switch.h
 // and https://github.com/pytorch/pytorch/blob/master/aten/src/ATen/Dispatch.h
-
+#include "arch.h"
 #pragma once
+
+#define CHECK_MSG(x, ...) do { if((x) == false) {throw std::invalid_argument(__VA_ARGS__);} }while(0)
 
 /// CONST_PRECOND && COND
 #define BOOL_SWITCH_AND_CONST_PRECOND(CONST_PRECOND, COND, CONST_NAME, ...) \
@@ -121,6 +123,23 @@
     }                                        \
   }()
 
+#define FLASH_ASSERT(cond)                                                                                \
+    do {                                                                                                  \
+        if (not (cond)) {                                                                                 \
+            fprintf(stderr, "Assertion failed (%s:%d): %s\n", __FILE__, __LINE__, #cond);                 \
+            exit(1);                                                                                      \
+        }                                                                                                 \
+    } while(0)
+
+
+#define FLASH_DEVICE_ASSERT(cond)                                                                         \
+    do {                                                                                                  \
+        if (not (cond)) {                                                                                 \
+            printf("Assertion failed (%s:%d): %s\n", __FILE__, __LINE__, #cond);                          \
+            asm("trap 0x1;");                                                                                 \
+        }                                                                                                 \
+    } while(0)
+
 #define NUMSPLITS_SWITCH(NUMSPLITS, ...)       \
   [&] {                                        \
     if (NUMSPLITS <= 2) {                      \
@@ -144,19 +163,70 @@
     } else if (NUMSPLITS <= 128) {             \
       constexpr static int kLogMaxSplits = 7;  \
       return __VA_ARGS__();                    \
-    }                                          \
+    }else if (NUMSPLITS <= 256) {             \
+      constexpr static int kLogMaxSplits = 8;  \
+      return __VA_ARGS__();                    \
+    }                                            \
   }()
 
-#define ROWNUM_SWITCH(COND, CONST_NAME, ...) \
-  [&] {                                      \
-    if (COND)                                \
-    {                                        \
-      constexpr static int CONST_NAME = 2;   \
-      return __VA_ARGS__();                  \
-    }                                        \
-    else                                     \
-    {                                        \
-      constexpr static int CONST_NAME = 1;   \
-      return __VA_ARGS__();                  \
-    }                                        \
+#define COMBINE_BLOCKM_SWITCH(BATCH, HEADQ, SEQLENQ, CONST_NAME, ...)      \
+  [&] {                                                                    \
+    const int tot_block_num = BATCH * HEADQ * SEQLENQ;                     \
+    const int totl_qo_num = SEQLENQ * HEADQ;                               \
+    if (totl_qo_num == 2)  {                                               \
+      constexpr static int CONST_NAME = 2;                                 \
+      return __VA_ARGS__();                                                \
+    }                                                                      \
+    else if (totl_qo_num < 16 && totl_qo_num % 4 == 0) {                   \
+      constexpr static int CONST_NAME = 4;                                 \
+      return __VA_ARGS__();                                                \
+    } else {                                                               \
+      if (tot_block_num >= 1024 && totl_qo_num % 16 == 0) {                \
+        constexpr static int CONST_NAME = 16;                              \
+        return __VA_ARGS__();                                              \
+      } else if (totl_qo_num % 4 == 0) {                                   \
+        constexpr static int CONST_NAME = 4;                               \
+        return __VA_ARGS__();                                              \
+      }                                                                    \
+      else {                                                               \
+        constexpr static int CONST_NAME = 1;                               \
+        return __VA_ARGS__();                                              \
+      }                                                                    \
+    }                                                                      \
   }()
+
+#if defined(XCORE1000)
+    #define ARCH_SWITCH ARCH_SWITCH_XCORE1000
+#elif defined(XCORE1500)
+    #define ARCH_SWITCH ARCH_SWITCH_XCORE1500
+#else
+    #define ARCH_SWITCH ARCH_SWITCH_ALL
+#endif
+
+#define ARCH_SWITCH_ALL(ARCH, ARCH_NAME, ...)                                                    \
+  [&] {                                                                                          \
+    if (ARCH == 1000) {                                                                          \
+      constexpr static Arch ARCH_NAME = Arch::xcore1000;                                         \
+      return __VA_ARGS__();                                                                      \
+    } else if (ARCH == 1500) {                                                                   \
+      constexpr static Arch ARCH_NAME = Arch::xcore1500;                                         \
+      return __VA_ARGS__();                                                                      \
+    } else {                                                                                     \
+       CHECK_MSG(false, "This arch xcore" + std::to_string(ARCH) +                               \
+                        " is not supported, please check your arch!");                           \
+    }                                                                                            \
+  }()
+
+#define ARCH_SWITCH_XCORE1000(ARCH, ARCH_NAME, ...)                                              \
+  [&] {                                                                                          \
+      constexpr static Arch ARCH_NAME = Arch::xcore1000;                                         \
+      return __VA_ARGS__();                                                                      \
+  }()
+
+#define ARCH_SWITCH_XCORE1500(ARCH, ARCH_NAME, ...)                                              \
+  [&] {                                                                                          \
+      constexpr static Arch ARCH_NAME = Arch::xcore1500;                                         \
+      return __VA_ARGS__();                                                                      \
+  }()
+
+

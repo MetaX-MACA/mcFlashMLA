@@ -10,122 +10,90 @@
 
 #include "flash_mla.h"
 #include "static_switch.h"
-#include "run_mha.h"
+#include "run_mla.h"
+#include "host_utils.h"
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
-// Find the number of splits that maximizes the occupancy. For example, if we have
-// batch * n_heads = 48 and we have 108 SMs, having 2 splits (efficiency = 0.89) is
-// better than having 3 splits (efficiency = 0.67). However, we also don't want too many
-// splits as that would incur more HBM reads/writes.
-// So we find the best efficiency, then find the smallest number of splits that gets 85%
-// of the best efficiency.
-int num_splits_heuristic(int batch_nheads_mblocks, int num_SMs, int num_n_blocks, int max_splits, float balance_weight) {
-    // If we have enough to almost fill the SMs, then just use 1 split
-    // if (batch_nheads_mblocks >= 0.9f * num_SMs) { return 1; }
-    max_splits = std::min({max_splits, num_SMs, num_n_blocks});
-    float max_efficiency = 0.f;
-    std::vector<float> efficiency;
-    efficiency.reserve(max_splits);
-    auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
-    // Some splits are not eligible. For example, if we have 64 blocks and choose 11 splits,
-    // we'll have 6 * 10 + 4 blocks. If we choose 12 splits, we'll have 6 * 11 + (-2) blocks
-    // (i.e. it's 11 splits anyway).
-    // So we check if the number of blocks per split is the same as the previous num_splits.
-    auto is_split_eligible = [&ceildiv, &num_n_blocks](int num_splits) {
-        return num_splits == 1 || ceildiv(num_n_blocks, num_splits) != ceildiv(num_n_blocks, num_splits - 1);
-    };
-    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-        if (!is_split_eligible(num_splits)) {
-            efficiency.push_back(0.f);
+inline int int64_stride_to_int(int64_t orig_stride) {
+    if (orig_stride > std::numeric_limits<int>::max()) {
+        TORCH_CHECK(false, "[Sparse TopK Attention] Stride exceeds int32 limit: ", orig_stride);
+    }
+    return static_cast<int>(orig_stride);
+}
+
+// Note: should match the kernel dispatch tile size
+inline std::pair<int, int> get_tile_size(int arch, int seqlen_q, bool is_sparse_attn) {
+    int block_m = 0;
+    int block_n = 0;
+    if (is_sparse_attn) {
+        // xcore1500 use the same kernel with xcore1000 in sparse decode now
+        block_m = 64, block_n = 16;
+    } else {
+        if (arch >= 1500) {
+            // only support blockM=64 in xcore1500 dense decode now
+            block_m = 64, block_n = 32;
         } else {
-            float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
-            float eff = n_waves / ceil(n_waves);
-            // printf("num_splits = %d, eff = %f\n", num_splits, eff);
-            if (eff > max_efficiency) { max_efficiency = eff; }
-            efficiency.push_back(eff);
+            if (seqlen_q >= 64) {
+                block_m = 64, block_n = 16;
+            } else if (seqlen_q >= 32) {
+                block_m = 32, block_n = 16;
+            } else {
+                block_m = 16, block_n = 16;
+            }
         }
     }
-    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
-        if (!is_split_eligible(num_splits)) { continue; }
-        if (efficiency[num_splits - 1] >= balance_weight * max_efficiency) {
-            // printf("num_splits chosen = %d\n", num_splits);
-            return num_splits;
-        }
-    }
-    return 1;
+    return {block_m, block_n};
 }
 
-void compute_params_numsplits(mcFlashAttn::Flash_fwd_mla_params &params, const int num_splits){
-    auto num_heads = params.h;
-    auto batch_size = params.b;
-    auto max_seqlen_k = params.seqlen_k;
-    auto max_seqlen_q = params.seqlen_q;
-    auto dprops = at::cuda::getCurrentDeviceProperties();
+struct DecodingAttnImplMeta {
+    int num_sm_parts;
+    int fixed_overhead_num_blocks;
+    int k_block_size;
+};
 
-    const int block_n = 16;
-    const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
-    const int block_m = max_seqlen_q >= 64 ? 64 : 32;
-    const int num_m_blocks = (max_seqlen_q + block_m - 1) / block_m;
-    params.num_splits = num_splits;
-
-    if (num_splits < 1) {
-        const int AP_nums = dprops->multiProcessorCount;
-        int block_nums_per_AP = 1;
-        // TODO: fine tune balance_weight later
-        float balance_weight = batch_size == 128 ? 0.95 : 0.9;
-        params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks,  AP_nums * block_nums_per_AP,
-                                                    num_n_blocks, 128, balance_weight);
-    }
-}
-
-std::vector<at::Tensor>
-get_mla_metadata(
-    at::Tensor &seqlens_k,
-    const int num_heads_per_head_k,
-    const int num_heads_k
+DecodingAttnImplMeta get_attn_impl_meta(
+    int arch,
+    int sm_count,
+    int num_q_tokens_per_head_k,
+    int h_k,
+    int block_m,
+    int block_n,
+    std::optional<int> h_q_,
+    bool is_fp8_kvcache,
+    bool is_sparse_attn
 ) {
-    // This should match the logic in the MLA kernel.
-    static constexpr int block_size_m = 64;
-    static constexpr int block_size_n = 64;
-    static constexpr int fixed_overhead_num_blocks = 5;
-
-    CHECK_DEVICE(seqlens_k);
-    TORCH_CHECK(seqlens_k.is_contiguous());
-    TORCH_CHECK(seqlens_k.dtype() == torch::kInt32);
-
-    int batch_size = seqlens_k.size(0);
-    int *seqlens_k_ptr = seqlens_k.data_ptr<int>();
-    auto options = seqlens_k.options();
-
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    int sm_count = dprops->multiProcessorCount;
-    int num_sm_parts = sm_count / num_heads_k / mctlass::ceil_div(num_heads_per_head_k, block_size_m);
-
-    auto tile_scheduler_metadata = torch::empty({num_sm_parts, TileSchedulerMetaDataSize}, options);
-    auto num_splits = torch::empty({batch_size + 1}, options);
-    int *tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();
-    int *num_splits_ptr = num_splits.data_ptr<int>();
-
-    at::cuda::CUDAGuard device_guard{(char)seqlens_k.get_device()};
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    Mla_metadata_params params = {};
-    params.seqlens_k_ptr = seqlens_k_ptr;
-    params.tile_scheduler_metadata_ptr = tile_scheduler_metadata_ptr;
-    params.num_splits_ptr = num_splits_ptr;
-    params.batch_size = batch_size;
-    params.block_size_n = block_size_n;
-    params.fixed_overhead_num_blocks = fixed_overhead_num_blocks;
-    params.num_sm_parts = num_sm_parts;
-    // get_mla_metadata_func(params, stream);
-
-    return {tile_scheduler_metadata, num_splits};
+    if (is_sparse_attn) {
+        if (is_fp8_kvcache) {
+            TORCH_CHECK(false, "Sparse fp8 MLA is not supported.");
+        } else {
+            // Sparse BF16 MLA
+            TORCH_CHECK(h_q_.has_value());
+            int h_q = h_q_.value();
+            TORCH_CHECK(h_q % h_k == 0, "h_k must be divisible by h_q.");
+            int s_q = num_q_tokens_per_head_k * h_k / h_q;
+            // BF16/FP16 + Sparse MLA
+            return {
+                std::max((sm_count/2) / h_k / (mctlass::ceil_div(h_q/h_k, 2*64) * s_q), 1),
+                5,
+                block_n // block_n
+            };
+        }
+    } else {
+        TORCH_CHECK(!is_fp8_kvcache, "FP8 KV Cache is not supported.");
+        // Dense BF16/FP8 MLA
+        return {
+            std::max(sm_count / h_k / mctlass::ceil_div(num_q_tokens_per_head_k, block_m), 1),
+            5,
+            block_n,
+        };
+    }
 }
 
 std::vector<at::Tensor>
-mha_fwd_kvcache_mla(
+fwd_kvcache_mla(
     at::Tensor &q,                               // batch_size x seqlen_q x num_heads x head_size
     const at::Tensor &kcache,                    // num_blocks x page_block_size x num_heads_k x head_size
     c10::optional<const at::Tensor> &vcache_,    // num_blocks x page_block_size x num_heads_k x head_size_v
@@ -135,17 +103,23 @@ mha_fwd_kvcache_mla(
     const float softmax_scale,
     bool is_causal,
     const at::Tensor &tile_scheduler_metadata,   // num_sm_parts x TileSchedulerMetaDataSize
-    const at::Tensor &num_splits                 // batch_size + 1
+    const at::Tensor &num_splits,                // batch_size + 1
+    bool is_fp8_kvcache,                         // fp8 kvcache=False
+    c10::optional<const at::Tensor> &indices,    // None, or batch_size x seqlen_q x topk
+    c10::optional<const at::Tensor> &indices_all_valid_per_q,    // batch_size x seqlen_q x 1, per-query flag indicating whether all top-k indices for each query token are valid.
+    int const cp_world_size,  // context parallelism (cp) world size
+    int const cp_rank,         // cp rank
+    c10::optional<const at::Tensor> &cp_tot_seqused_k_ // b. total seqused_k in cp world
 ) {
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
-    // TORCH_CHECK(is_sm90);
+    auto dprops = flash::mcGetCurrentDeviceProperties();
+    int arch = dprops.major * 100 + dprops.minor;
 
     at::Tensor vcache = vcache_.has_value() ? vcache_.value() : kcache;
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kBFloat16 || q_dtype == torch::kFloat16);
     TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
+    TORCH_CHECK(!is_fp8_kvcache, "flash mla with kvcache api not support fp8 now");
 
     CHECK_DEVICE(q); CHECK_DEVICE(kcache); CHECK_DEVICE(vcache);
 
@@ -156,6 +130,14 @@ mha_fwd_kvcache_mla(
     CHECK_DEVICE(block_table);
     TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype torch.int32");
     TORCH_CHECK(block_table.stride(-1) == 1, "block_table must have contiguous last dimension");
+
+    bool is_sparse_attn = indices.has_value();
+    int topk = is_sparse_attn ? indices->size(-1) : -1;
+    TORCH_CHECK(!is_sparse_attn || indices->dtype() == torch::kInt32, "indices must have dtype int32");
+    TORCH_CHECK(!is_sparse_attn || indices->stride(-1) == 1, "indices must have contiguous last dimension");
+    TORCH_CHECK(!is_sparse_attn || indices_all_valid_per_q->dtype() == torch::kBool, "indices_all_valid_per_q must have dtype bool");
+    TORCH_CHECK(!is_sparse_attn || indices_all_valid_per_q->stride(-1) == 1, "indices_all_valid_per_q must have contiguous last dimension");
+
 
     const auto sizes = q.sizes();
     const int batch_size = sizes[0];
@@ -176,6 +158,9 @@ mha_fwd_kvcache_mla(
     const int ngroups = num_heads_ori / num_heads_k;
     const int seqlen_q = seqlen_q_ori * ngroups;
     const int num_heads = num_heads_k;
+    if (is_sparse_attn){
+        TORCH_CHECK(num_heads_ori >= 64 || seqlen_q_ori == 1, "sparse decoding head q must greter than 64 when seqlen q > 1");
+    }
     q = q.view({batch_size, seqlen_q_ori, num_heads_k, ngroups, head_size}).transpose(2, 3)
             .reshape({batch_size, seqlen_q, num_heads, head_size});
 
@@ -191,6 +176,15 @@ mha_fwd_kvcache_mla(
     CHECK_CONTIGUOUS(seqlens_k);
     CHECK_SHAPE(seqlens_k, batch_size);
 
+    if (cp_tot_seqused_k_.has_value()) {
+        auto cp_tot_seqused_k = cp_tot_seqused_k_.value();
+        TORCH_CHECK(cp_tot_seqused_k.dtype() == torch::kInt32, "seqused_k must have dtype int32");
+        CHECK_DEVICE(cp_tot_seqused_k); CHECK_CONTIGUOUS(cp_tot_seqused_k);
+        CHECK_SHAPE(cp_tot_seqused_k, batch_size);
+    }
+
+
+
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
@@ -202,13 +196,15 @@ mha_fwd_kvcache_mla(
     // Set the sizes.
     params.b = batch_size;
     params.seqlen_q = seqlen_q;
-    params.seqlen_k = seqlens_k.max().cpu().item<int>();
+    // params.seqlen_k = seqlens_k.max().cpu().item<int>();
     params.cu_seqlens_k = seqlens_k.data_ptr<int>();
     params.is_seqlens_k_cumulative = false; // seqlens_k always has value
     params.h = num_heads;
     params.h_h_k_ratio = num_heads / num_heads_k;
     params.ngroups = ngroups;
     params.is_causal = is_causal;
+    params.is_sparse_attn = is_sparse_attn;
+    params.topk = topk;
     params.d = head_size;
     params.d_v = head_size_v;
     params.scale_softmax = softmax_scale;
@@ -233,34 +229,49 @@ mha_fwd_kvcache_mla(
     params.v_head_stride = vcache.stride(-2);
     params.o_head_stride = out.stride(-2);
 
+    // indices ptr
+    params.indices_ptr = is_sparse_attn ? indices->data_ptr<int32_t>() : nullptr;
+    params.indices_batch_stride = is_sparse_attn ? indices->stride(0) : 0;
+    params.indices_row_stride = is_sparse_attn ? indices->stride(1) : 0;
+
+    params.indices_all_valid_per_q_ptr = is_sparse_attn ? indices_all_valid_per_q->data_ptr<bool>() : nullptr;
+    params.indices_all_valid_per_q_batch_stride = is_sparse_attn ? indices_all_valid_per_q->stride(0) : 0;
+    params.indices_all_valid_per_q_row_stride = is_sparse_attn ? indices_all_valid_per_q->stride(1) : 0;
+
     params.block_table = block_table.data_ptr<int>();
     params.block_table_batch_stride = block_table.stride(0);
     params.page_block_size = page_block_size;
+    params.arch = arch;
+
+    params.cp_world_size = cp_world_size;
+    params.cp_rank = cp_rank;
+    params.cp_tot_seqused_k = cp_tot_seqused_k_.has_value() ? cp_tot_seqused_k_->data_ptr<int>() : nullptr;
+    TORCH_CHECK(cp_world_size > 0, "cp_world_size must be positive, required by downstream unified code path. Use 1 if CP is not enabled.");
+    TORCH_CHECK(cp_world_size != 1 || cp_rank == 0, "When context parallelism is disabled, cp_rank must be zero");
+    TORCH_CHECK(cp_world_size == 1 || cp_tot_seqused_k_.has_value(), "cp_tot_seqused_k_ must be provided when context parallelism is enabled.");
+
+    TORCH_CHECK(num_splits.dtype() == torch::kInt32, "num_splits must have dtype int32");
+    // printf("num_splits%d",num_splits);
+    CHECK_DEVICE(num_splits);
+    CHECK_CONTIGUOUS(num_splits);
 
     TORCH_CHECK(tile_scheduler_metadata.dtype() == torch::kInt32, "tile_scheduler_metadata must have dtype int32");
     TORCH_CHECK(tile_scheduler_metadata.size(1) == TileSchedulerMetaDataSize);
     CHECK_DEVICE(tile_scheduler_metadata);
     CHECK_CONTIGUOUS(tile_scheduler_metadata);
-    // params.tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();
-    // params.num_sm_parts = tile_scheduler_metadata.size(0);
-    TORCH_CHECK(num_splits.dtype() == torch::kInt32, "num_splits must have dtype int32");
-    CHECK_DEVICE(num_splits);
-    CHECK_CONTIGUOUS(num_splits);
-    // params.num_splits_ptr = num_splits.data_ptr<int>();
-
-    const int max_num_splits = 128;
-    // TODO: enable get_mla_mate_data for load balance
-    compute_params_numsplits(params, 0);
-    TORCH_CHECK(params.num_splits <= max_num_splits, "num_splits must less than or equal to 128");
-    at::Tensor softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q}, opts.dtype(torch::kFloat32));
-    at::Tensor out_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen_q, head_size_v}, opts.dtype(torch::kFloat32));
+    params.tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();
+    params.num_sm_parts = tile_scheduler_metadata.size(0);
+    params.num_splits_ptr = num_splits.data_ptr<int>();
+    at::Tensor softmax_lse_accum = torch::empty({batch_size + params.num_sm_parts, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+    at::Tensor out_accum = torch::empty({batch_size + params.num_sm_parts, num_heads, seqlen_q, head_size_v}, opts.dtype(at::kFloat));
     params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
     params.oaccum_ptr = out_accum.data_ptr();
+
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     TORCH_CHECK(head_size == 576);
     params.is_bf16 = q_dtype == torch::kBFloat16;
-    run_mha_fwd(params,stream, /*force_split_kernel*/true);
+    run_mla_fwd(params, stream);
     out = out.view({batch_size, seqlen_q_ori, ngroups, num_heads_k, head_size_v}).transpose(2, 3)
             .reshape({batch_size, seqlen_q_ori, num_heads_ori, head_size_v});
     softmax_lse = softmax_lse.view({batch_size, num_heads_k, seqlen_q_ori, ngroups}).transpose(2, 3)
@@ -268,9 +279,148 @@ mha_fwd_kvcache_mla(
     return {out, softmax_lse};
 }
 
+
+std::vector<at::Tensor> sparse_prefill_fwd(
+    const at::Tensor &q,
+    const at::Tensor &kv,
+    const at::Tensor &indices,
+    float sm_scale,
+    int d_v,
+    const at::Tensor &indices_all_valid_per_q
+) {
+    auto dprops = flash::mcGetCurrentDeviceProperties();
+    int arch = dprops.major * 100 + dprops.minor;
+
+    CHECK_DEVICE(q);
+    CHECK_DEVICE(kv);
+    CHECK_DEVICE(indices);
+    CHECK_DEVICE(indices_all_valid_per_q);
+
+    TORCH_CHECK(q.dtype() == torch::kBFloat16);
+    TORCH_CHECK(kv.dtype() == torch::kBFloat16);
+    TORCH_CHECK(indices.dtype() == torch::kInt32);
+    TORCH_CHECK(indices_all_valid_per_q.dtype() == torch::kBool);
+
+    int s_q = q.size(0);
+    int s_kv = kv.size(0);
+    int h_q = q.size(1);
+    int h_kv = kv.size(1);
+    int d_qk = q.size(2);
+    int topk = indices.size(2);
+    TORCH_CHECK(h_q % 64 == 0 && h_q >= 64);
+
+    CHECK_SHAPE(q, s_q, h_q, d_qk);
+    CHECK_SHAPE(kv, s_kv, h_kv, d_qk);
+    CHECK_SHAPE(indices, s_q, h_kv, topk);
+    CHECK_SHAPE(indices_all_valid_per_q, s_q, 1);
+
+    TORCH_CHECK(q.stride(-1) == 1);
+    TORCH_CHECK(kv.stride(-1) == 1);
+    TORCH_CHECK(indices.stride(-1) == 1);
+
+    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    auto opts = q.options();
+    at::Tensor out = torch::empty({s_q, h_q, d_v}, opts);
+    CHECK_CONTIGUOUS(out);
+
+    at::Tensor buf_attn_score, max_logits, lse, p_sum;
+    max_logits = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+    lse = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+    CHECK_CONTIGUOUS(max_logits);
+    CHECK_CONTIGUOUS(lse);
+
+    SparsePrefillParams params = {
+        s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
+        sm_scale, sm_scale * 1.44269504f,
+        arch,
+        (mctlass::bfloat16_t*)q.data_ptr(),
+        (mctlass::bfloat16_t*)kv.data_ptr(),
+        (int*)indices.data_ptr(),
+        (bool*)indices_all_valid_per_q.data_ptr(),
+
+        int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)),
+        int64_stride_to_int(kv.stride(0)), int64_stride_to_int(kv.stride(1)),
+        int64_stride_to_int(indices.stride(0)), int64_stride_to_int(indices.stride(1)),
+        int64_stride_to_int(out.stride(0)),int64_stride_to_int(out.stride(1)),
+
+        (mctlass::bfloat16_t*)out.data_ptr(),
+        (float*)max_logits.data_ptr(),
+        (float*)lse.data_ptr(),
+
+        at::cuda::getCurrentCUDAStream().stream()
+    };
+
+    run_mla_fwd(params);
+
+    return {out, max_logits, lse};
+}
+
+std::vector<at::Tensor>
+get_mla_decoding_metadata(
+    at::Tensor &seqlens_k,
+    const int num_q_tokens_per_head_k,
+    const int h_k,
+    const std::optional<int> h_q,
+    const bool is_fp8_kvcache,
+    const std::optional<int> topk
+) {
+    auto dprops = flash::mcGetCurrentDeviceProperties();
+    int arch = dprops.major * 100 + dprops.minor;
+    // This should match the logic in the MLA kernel.
+    const int seqlen_q  = num_q_tokens_per_head_k * h_k;
+    bool is_sparse_attn = topk.has_value();
+    const auto [block_size_m, block_size_n] = get_tile_size(arch, seqlen_q, is_sparse_attn);
+
+    CHECK_DEVICE(seqlens_k);
+    TORCH_CHECK(seqlens_k.is_contiguous());
+    TORCH_CHECK(seqlens_k.dtype() == torch::kInt32);
+    if (is_sparse_attn)
+        TORCH_CHECK(h_q.has_value(), "num_heads_q must be provided when topk is provided");
+
+    CHECK_DEVICE(seqlens_k);
+    TORCH_CHECK(seqlens_k.is_contiguous());
+    TORCH_CHECK(seqlens_k.dtype() == torch::kInt32);
+
+    int batch_size = seqlens_k.size(0);
+    int *seqlens_k_ptr = seqlens_k.data_ptr<int>();
+    auto options = seqlens_k.options();
+
+    int sm_count = dprops.multiProcessorCount;
+    const char* val = std::getenv("FMLA_SM");
+    if(val != nullptr){
+        sm_count = std::stoi(val);
+    }
+
+    DecodingAttnImplMeta attn_impl_meta = get_attn_impl_meta(arch, sm_count, num_q_tokens_per_head_k, h_k, block_size_m, block_size_n, h_q, is_fp8_kvcache, is_sparse_attn);
+    if(std::getenv("FMLA_LOG")){
+        printf("block_size_m %d, num_q_tokens_per_head_k %d, h_k %d, seqlen_q %d, sm_count %d, sm_parts %d \n",
+        block_size_m, num_q_tokens_per_head_k, h_k, seqlen_q, sm_count, attn_impl_meta.num_sm_parts);
+    }
+
+    auto tile_scheduler_metadata = torch::empty({attn_impl_meta.num_sm_parts, TileSchedulerMetaDataSize}, options);
+    auto num_splits = torch::empty({batch_size + 1}, options);
+    int *tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();
+    int *num_splits_ptr = num_splits.data_ptr<int>();
+
+    at::cuda::CUDAGuard device_guard{(char)seqlens_k.get_device()};
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    GetDecodingMetadataParams params = {};
+    params.seqlens_k_ptr = seqlens_k_ptr;
+    params.tile_scheduler_metadata_ptr = tile_scheduler_metadata_ptr;
+    params.num_splits_ptr = num_splits_ptr;
+    params.batch_size = batch_size;
+    params.block_size_n = attn_impl_meta.k_block_size;
+    params.fixed_overhead_num_blocks = attn_impl_meta.fixed_overhead_num_blocks;
+    params.num_sm_parts = attn_impl_meta.num_sm_parts;
+    params.topk = is_sparse_attn ? topk.value() : -1;
+    run_get_mla_metadata_kernel(params, stream);
+
+    return {tile_scheduler_metadata, num_splits};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "FlashAttention";
-    //FlashMLA
-    m.def("get_mla_metadata", &get_mla_metadata);
-    m.def("fwd_kvcache_mla", &mha_fwd_kvcache_mla);
+    m.doc() = "FlashMLA";
+    m.def("get_mla_metadata", &get_mla_decoding_metadata);
+    m.def("fwd_kvcache_mla", &fwd_kvcache_mla);
+    m.def("sparse_prefill_fwd", &sparse_prefill_fwd);
 }
